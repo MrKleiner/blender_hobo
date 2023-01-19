@@ -81,6 +81,7 @@ from bpy.types import (Panel,
 					   PropertyGroup,
 					   )
 
+
 addon_root_dir = Path(__file__).absolute().parent
 magix_exe = addon_root_dir / 'bins' / 'imgmagick' / 'magick.exe'
 nvtools_exe = addon_root_dir / 'bins' / 'nvtextools' / 'nvcompress.exe'
@@ -145,7 +146,7 @@ def ensure_database_present(dpath):
 
 	if (dpath / 'sys').is_dir():
 		return
-
+	(dpath / 'sys').mkdir()
 
 	# Conversion history
 	connection = sqlite3.connect(str(dpath / 'sys' / 'conv_hist.db'))
@@ -156,7 +157,7 @@ def ensure_database_present(dpath):
 			creator_name VARCHAR,
 			img_src VARCHAR NOT NULL,
 			img_src_hash CHAR(64) NOT NULL UNIQUE,
-			img_hash VARCHAR NOT NULL UNIQUE,
+			img_path_hash VARCHAR NOT NULL,
 			src_size BIGINT,
 			conv_size INT,
 			conv_with VARCHAR,
@@ -176,7 +177,8 @@ def ensure_database_present(dpath):
 			img_hash VARCHAR NOT NULL,
 			user VARCHAR NOT NULL,
 			user_hash CHAR(64) NOT NULL,
-			user_name VARCHAR NOT NULL
+			user_name VARCHAR NOT NULL,
+			UNIQUE(img_hash, user, user_hash, user_name)
 		);
 	""")
 	connection.commit()
@@ -250,9 +252,33 @@ def hobo_to_dds_nvidia(fpath):
 		print('bad conversion')
 		return False
 
+
 def hobo_invert_exclusion_case(self, context):
 	for img in bpy.data.images:
 		img.hobo_image_params.do_convert = not img.hobo_image_params.do_convert
+
+def hobo_add_img_dep(image_hash):
+	dump_dir = Path(bpy.context.preferences.addons[hobo_name].preferences.dumpster_path)
+
+	connection_deps = sqlite3.connect(str(dump_dir / 'sys' / 'deps.db'))
+	cursor_deps = connection_deps.cursor()
+
+	current_blend = Path(bpy.path.abspath(bpy.data.filepath))
+
+	insert_params = ("""
+		INSERT OR REPLACE INTO deps
+		(img_hash, user, user_hash, user_name)
+		VALUES (?, ?, ?, ?);
+	""")
+	data_tuple = (
+		image_hash,
+		str(current_blend),
+		hashlib.sha256(str(current_blend).encode()).hexdigest(),
+		str(current_blend.name)
+	)
+	cursor_deps.execute(insert_params, data_tuple)
+	connection_deps.commit()
+	connection_deps.close()
 
 
 
@@ -260,8 +286,14 @@ def hobo_exec_opt(self, context, force=False):
 	print('You hobo')
 	print(bpy.context.preferences.addons[hobo_name].preferences.dumpster_path)
 	dump_dir = Path(bpy.context.preferences.addons[hobo_name].preferences.dumpster_path)
+	current_blend = Path(bpy.path.abspath(bpy.data.filepath))
 
 	ensure_database_present(dump_dir)
+
+	# connection_deps = sqlite3.connect(str(dump_dir / 'sys' / 'deps.db'))
+	# cursor_deps = connection_deps.cursor()
+	connection_hist = sqlite3.connect(str(dump_dir / 'sys' / 'conv_hist.db'))
+	cursor_hist = connection_hist.cursor()
 
 	collected = {}
 	context.scene.hobo_config.saved_space = 0
@@ -344,12 +376,15 @@ def hobo_exec_opt(self, context, force=False):
 				print('collected', img_path)
 				collected[img_path_hash] = (img_path, tgt_img, img_hash)
 			else:
+
+				hobo_add_img_dep(img_hash)
+
 				tgt_img.filepath = str(converted_image_path)
 				tgt_img['hobo_is_converted'] = True
 				tgt_img['hobo_original_path'] = str(img_path)
 				context.scene.hobo_config.saved_space += os.stat(str(img_path)).st_size - os.stat(str(converted_image_path)).st_size
 
-
+		
 
 	# process image paths
 	for to_dds in collected:
@@ -379,7 +414,31 @@ def hobo_exec_opt(self, context, force=False):
 			tgt_img_dna.filepath = str(new_img_path)
 			tgt_img_dna.reload()
 
+			hobo_add_img_dep(tgt_img_hash)
 
+			insert_params = ("""
+				INSERT OR REPLACE INTO history
+				(creator_path, creator_name, img_src, img_src_hash, img_path_hash, src_size, conv_size, conv_with, conv_format, conv_ext)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+			""")
+			data_tuple = (
+				str(current_blend),
+				current_blend.name,
+				str(tgt_img_path),
+				tgt_img_hash,
+				hashlib.sha256(str(tgt_img_path).encode()).hexdigest(),
+				os.stat(str(tgt_img_path)).st_size,
+				len(dds_bytes),
+				'nvidia_adv',
+				'bc3',
+				'dds'
+			)
+			cursor_hist.execute(insert_params, data_tuple)
+
+	connection_hist.commit()
+
+	connection_hist.close()
+	# connection_deps.close()
 
 	print('Hobo done opts')
 
@@ -494,8 +553,8 @@ class blender_hobo_scene_property_declaration(PropertyGroup):
 	comp_level : EnumProperty(
 		items=[
 			('Regular', 'Regular', 'Regular'),
-			('Increased', 'Increased', 'Increased'),
-			('DOOM 1996', 'DOOM 1996', 'DOOM 1996')
+			('Increased', 'Increased', 'Try different methods when compressing'),
+			('DOOM 1996', 'DOOM 1996', 'Use the highest sane compression possible')
 		],
 		name='Compression Level',
 		description='Compression Level',
