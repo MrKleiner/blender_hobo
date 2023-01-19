@@ -1,3 +1,4 @@
+hobo_name = __name__.partition('.')[0]
 
 bl_info = {
 	'name': 'Blender Hobo',
@@ -12,11 +13,17 @@ bl_info = {
 }
 
 # hobo_name = bl_info['name']
-hobo_name = __name__.partition('.')[0]
 
 
 
 
+#
+# This does not increase speed. This is only needed if you run out of VRAM due to large textures when rendering
+#
+
+
+
+# The difference between Simplify and this is that the texture size stays the same
 
 # Nothing is converted twice, the filename of the converted image is sha256 of the source image
 # 	But it's possible to force-reconvert
@@ -29,7 +36,7 @@ hobo_name = __name__.partition('.')[0]
 
 # If the filesize of the converted image is bigger than source - the operation is discarded and image is marked as done
 
-
+# All the associations are stored in a few database files for convenience
 
 
 
@@ -54,10 +61,8 @@ hobo_name = __name__.partition('.')[0]
 
 import bpy
 
-import hashlib, random, mathutils, time, datetime, subprocess, shutil, sys, os, json, math, re
+import hashlib, random, mathutils, time, datetime, subprocess, shutil, sys, os, json, math, re, sqlite3
 
-from bpy.types import Operator
-from bpy.props import FloatVectorProperty
 from bpy_extras.object_utils import AddObjectHelper, object_data_add
 
 from pathlib import Path
@@ -79,6 +84,7 @@ from bpy.types import (Panel,
 addon_root_dir = Path(__file__).absolute().parent
 magix_exe = addon_root_dir / 'bins' / 'imgmagick' / 'magick.exe'
 nvtools_exe = addon_root_dir / 'bins' / 'nvtextools' / 'nvcompress.exe'
+nvtools_adv_exe = addon_root_dir / 'bins' / 'nvtextools' / 'nvtt_export.exe'
 
 
 
@@ -133,6 +139,53 @@ def ensure_addon_is_set_up():
 
 ensure_addon_is_set_up()
 
+
+def ensure_database_present(dpath):
+	dpath = Path(dpath)
+
+	if (dpath / 'sys').is_dir():
+		return
+
+
+	# Conversion history
+	connection = sqlite3.connect(str(dpath / 'sys' / 'conv_hist.db'))
+	cursor_obj = connection.cursor()
+	cursor_obj.execute("""
+		CREATE TABLE history (
+			creator_path VARCHAR,
+			creator_name VARCHAR,
+			img_src VARCHAR NOT NULL,
+			img_src_hash CHAR(64) NOT NULL UNIQUE,
+			img_hash VARCHAR NOT NULL UNIQUE,
+			src_size BIGINT,
+			conv_size INT,
+			conv_with VARCHAR,
+			conv_format VARCHAR,
+			conv_ext VARCHAR(16) NOT NULL
+		);
+	""")
+	connection.commit()
+	connection.close()
+
+
+	# Dependencies
+	connection = sqlite3.connect(str(dpath / 'sys' / 'deps.db'))
+	cursor_obj = connection.cursor()
+	cursor_obj.execute("""
+		CREATE TABLE deps (
+			img_hash VARCHAR NOT NULL,
+			user VARCHAR NOT NULL,
+			user_hash CHAR(64) NOT NULL,
+			user_name VARCHAR NOT NULL
+		);
+	""")
+	connection.commit()
+	connection.close()
+
+
+
+
+
 def hobo_rnd_id():
 	return hashlib.sha256(('!lizard?'.join([str(random.random()) for rnd in range(int(256))])).encode()).hexdigest()
 
@@ -163,10 +216,26 @@ def hobo_to_dds_nvidia(fpath):
 		str(nvtools_exe),
 		'-fast',
 		# can't wait for bc7 Blender support...
+		'-nomips' if bpy.context.scene.hobo_config.generate_mips == True else '',
 		'-bc3',
 		str(fpath),
 		str(tmp_path)
 	]
+
+	nvidia_prms = [
+		str(nvtools_adv_exe),
+		# can't wait for bc7 Blender support...
+		'-f', '18',
+		# '-f', '15',
+		'-q', '0',
+		'--mips' if bpy.context.scene.hobo_config.generate_mips == True else '--no-mips',
+		'--mip-filter', '1',
+		'-o', str(tmp_path),
+
+		str(fpath)
+	]
+
+	nvidia_prms = filter(None, nvidia_prms)
 
 	dds_echo = None
 	with subprocess.Popen(nvidia_prms, stdout=subprocess.PIPE, bufsize=10**8) as img_pipe:
@@ -181,7 +250,9 @@ def hobo_to_dds_nvidia(fpath):
 		print('bad conversion')
 		return False
 
-
+def hobo_invert_exclusion_case(self, context):
+	for img in bpy.data.images:
+		img.hobo_image_params.do_convert = not img.hobo_image_params.do_convert
 
 
 
@@ -190,10 +261,14 @@ def hobo_exec_opt(self, context, force=False):
 	print(bpy.context.preferences.addons[hobo_name].preferences.dumpster_path)
 	dump_dir = Path(bpy.context.preferences.addons[hobo_name].preferences.dumpster_path)
 
-	collected = {}
+	ensure_database_present(dump_dir)
 
-	# collect image paths
+	collected = {}
+	context.scene.hobo_config.saved_space = 0
+
+	# collect images to convert
 	for mat in bpy.data.materials:
+		# Some materials don't use nodes
 		if mat.use_nodes != True:
 			continue
 
@@ -202,32 +277,78 @@ def hobo_exec_opt(self, context, force=False):
 				continue
 
 			tgt_img = mnode.image
+			# this can point to a missing file if the the image was converted, but the resulting dds deleted later
 			img_path = Path(bpy.path.abspath(tgt_img.filepath))
-
+			img_path_hash = hashlib.sha1(str(img_path).encode()).hexdigest()
+			# this can be none
+			original_img_path = Path(str(tgt_img.get('hobo_original_path')))
+			# print(tgt_img.name, context.scene.hobo_config.as_exclusion == False,  tgt_img.hobo_image_params.do_convert == False)
 			do_skip = (
-				# if scene is set to manual exclude
-				context.scene.hobo_config.as_exclusion == True and tgt_img.hobo_image_params.do_convert == False,
-				# if scene is set to manual include
-				context.scene.hobo_config.as_exclusion == False and tgt_img.hobo_image_params.do_convert != True,
-				# if image was converted already
-				tgt_img.get('hobo_is_converted') == True,
+				# if scene is set to manual exclude, then do_convert should not be True (image is not excluded)
+				context.scene.hobo_config.as_exclusion == True and tgt_img.hobo_image_params.do_convert == True,
+				# if scene is set to manual include, then do_convert should not be False (image is included)
+				context.scene.hobo_config.as_exclusion == False and tgt_img.hobo_image_params.do_convert == False,
 				# don't mind packed shit for now
 				tgt_img.is_embedded_data == True,
-				# do nothing if it's dds already
-				img_path.suffix.lower() == '.dds'
+				# do nothing if the original source is dds
+				img_path.suffix.lower() == '.dds' and tgt_img.get('hobo_is_converted') != True,
+				# If this is the second encounter of the same image - skip
+				img_path_hash in collected,
+				# If this image was not converted and the image file is missing (happens). Skip
+				tgt_img.get('hobo_is_converted') == False and not img_path.is_file()
 			)
 
 			if True in do_skip:
+				# print(do_skip)
 				continue
 
+			# if this image was converted, but the converted dds was later deleted - reconvert
+			# OR if the force is set to true
+			if tgt_img.get('hobo_is_converted') == True and not img_path.is_file():
+				del tgt_img['hobo_is_converted']
+				tgt_img.filepath = tgt_img['hobo_original_path']
+				tgt_img['hobo_original_path'] = None
+				if 'hobo_hash' in tgt_img:
+					del tgt_img['hobo_hash']
+
+			# at this point it's only left to believe that hobo_is_converted doesn't lie
+			if tgt_img.get('hobo_is_converted') == True and force != True:
+				# account savings
+				try:
+					context.scene.hobo_config.saved_space += os.stat(tgt_img['hobo_original_path']).st_size - os.stat(str(img_path)).st_size
+				except Exception as e:
+					pass
+
+				continue
+
+			if force == True:
+				tgt_img['hobo_hash'] = None
+				tgt_img.filepath = tgt_img['hobo_original_path']
+				img_path = Path(bpy.path.abspath(tgt_img.filepath))
+				tgt_img['hobo_original_path'] = None
+
+			# Get image hash
 			img_hash = tgt_img.get('hobo_hash')
 			if not img_hash:
 				img_hash = hashlib.sha256(img_path.read_bytes()).hexdigest()
 				tgt_img['hobo_hash'] = img_hash
 
-			if not (dump_dir / f'{img_hash}.dds').is_file():
+			# this path MAY contain a converted image
+			converted_image_path = dump_dir / f'{img_hash}.dds'
+
+			if force == True:
+				converted_image_path.unlink(missing_ok=True)
+
+
+			if not converted_image_path.is_file():
 				print('collected', img_path)
-				collected[hashlib.sha1(str(img_path).encode()).hexdigest()] = (img_path, tgt_img, img_hash)
+				collected[img_path_hash] = (img_path, tgt_img, img_hash)
+			else:
+				tgt_img.filepath = str(converted_image_path)
+				tgt_img['hobo_is_converted'] = True
+				tgt_img['hobo_original_path'] = str(img_path)
+				context.scene.hobo_config.saved_space += os.stat(str(img_path)).st_size - os.stat(str(converted_image_path)).st_size
+
 
 
 	# process image paths
@@ -251,6 +372,8 @@ def hobo_exec_opt(self, context, force=False):
 		# in this case - discard everything and move on
 		if os.stat(str(tgt_img_path)).st_size > len(dds_bytes):
 			print('good size')
+			# context.scene.hobo_config.saved_space += int(len(dds_bytes) / (1024*1024*1024))
+			context.scene.hobo_config.saved_space += os.stat(str(tgt_img_path)).st_size - len(dds_bytes)
 			new_img_path = (dump_dir / f'{tgt_img_hash}.dds')
 			new_img_path.write_bytes(dds_bytes)
 			tgt_img_dna.filepath = str(new_img_path)
@@ -283,6 +406,23 @@ class OBJECT_OT_hobo_exec_opt(Operator, AddObjectHelper):
 		return {'FINISHED'}
 
 
+class OBJECT_OT_hobo_exec_opt_force(Operator, AddObjectHelper):
+	bl_idname = 'mesh.hobo_optimize_force'
+	bl_label = 'Opt Hobo'
+	bl_options = {'REGISTER'}
+
+	def execute(self, context):
+		hobo_exec_opt(self, context, True)
+		return {'FINISHED'}
+
+
+
+
+
+
+
+
+
 
 
 
@@ -310,9 +450,17 @@ class blender_hobo_image_property_declaration(PropertyGroup):
 	do_convert : BoolProperty(
 		name='Convert',
 		description='Whether to convert the image or not',
+		default=False
+	)
+
+
+class blender_hobo_material_property_declaration(PropertyGroup):
+	exclude_material : BoolProperty(
+		name='Exclude Material',
+		description='Whether to convert the image or not',
 		default=True
 	)
-		
+
 
 
 class blender_hobo_scene_property_declaration(PropertyGroup):
@@ -320,10 +468,39 @@ class blender_hobo_scene_property_declaration(PropertyGroup):
 		name='Exclusion',
 		description=""" When checked - Individual images have to be excluded from conversion.
 		When UNchecked - individual images have to be marked for conversion.
-		Go to the Hobo panel in the Image Editor/Node Editor panel and look for a self-explanatory checkbox""",
+		Go to the Hobo panel in the Image Editor/Node Editor N panel and look for a self-explanatory checkbox""",
+		default=False,
+		update=hobo_invert_exclusion_case
+	)
+
+	generate_mips : BoolProperty(
+		name='Mipmaps',
+		description="""Whether to generate mipmaps or not""",
 		default=True
 	)
 
+	saved_space : IntProperty(
+		name='Saved Space',
+		description="""Total gb VRAM saved""",
+		default=0
+	)
+
+	scene_vram_total : IntProperty(
+		name='Total VRAM taken',
+		description="""VRAM taken by all the images in every material""",
+		default=0
+	)
+
+	comp_level : EnumProperty(
+		items=[
+			('Regular', 'Regular', 'Regular'),
+			('Increased', 'Increased', 'Increased'),
+			('DOOM 1996', 'DOOM 1996', 'DOOM 1996')
+		],
+		name='Compression Level',
+		description='Compression Level',
+		default='Regular'
+	)
 
 
 class blender_hobo_addon_prefs(bpy.types.AddonPreferences):
@@ -391,8 +568,16 @@ class VIEW3D_PT_blender_hobo_scene_params_gui(bpy.types.Panel):
 		dumpster.operator('mesh.hobo_optimize',
 			text='I want my scene to look rubbish'
 		)
-		dumpster.label(text=' ')
+		# dumpster.label(text='')
+		dumpster.operator('mesh.hobo_optimize_force',
+			text='Force regenerate'
+		)
+		dumpster.label(text=f'VRAM saved: {round(context.scene.hobo_config.saved_space / (1024*1024*1024), 3)} GB')
+		dumpster.label(text='Compression Level')
+		comp_level_row = dumpster.row()
+		comp_level_row.prop(context.scene.hobo_config, 'comp_level', expand=True)
 		dumpster.prop(context.scene.hobo_config, 'as_exclusion')
+		dumpster.prop(context.scene.hobo_config, 'generate_mips')
 
 
 
@@ -418,33 +603,27 @@ class IMAGE_EDITOR_PT_blender_hobo_image_params_gui(bpy.types.Panel):
 
 
 
+#
+# Node editor
+#
+class NODE_PT_blender_hobo_image_params_from_node_gui(bpy.types.Panel):
+	bl_space_type = 'NODE_EDITOR'
+	bl_region_type = 'UI'
+	bl_category = 'Hobo'
+	bl_label = 'Hobo'
+	# https://youtu.be/sT3joXENOb0
 
+	def draw(self, context):
+		node = context.active_node
 
+		if node.type == 'TEX_IMAGE':
+			layout = self.layout
 
+			dumpster = layout.column(align=True)
+			# dumpster.use_property_split = True
+			# dumpster.use_property_decorate = False
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+			dumpster.prop(node.image.hobo_image_params, 'do_convert', text=('Exclude' if context.scene.hobo_config.as_exclusion else 'Include'))
 
 
 
@@ -480,7 +659,9 @@ rclasses = (
 	VIEW3D_PT_blender_hobo_scene_params_gui,
 	blender_hobo_image_property_declaration,
 	blender_hobo_scene_property_declaration,
-	blender_hobo_addon_prefs
+	blender_hobo_addon_prefs,
+	OBJECT_OT_hobo_exec_opt_force,
+	NODE_PT_blender_hobo_image_params_from_node_gui
 )
 
 register_, unregister_ = bpy.utils.register_classes_factory(rclasses)
@@ -495,7 +676,8 @@ def register():
 	# Global Config per scene
 	bpy.types.Scene.hobo_config = PointerProperty(type=blender_hobo_scene_property_declaration)
 
-
+	# Config per material
+	bpy.types.Scene.hobo_config = PointerProperty(type=blender_hobo_scene_property_declaration)
 
 
 
