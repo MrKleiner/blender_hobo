@@ -6,8 +6,9 @@ bl_info = {
 	'version': (0, 19),
 	'blender': (3, 4, 0),
 	'location': 'N menu',
-	'description': """Fit more dicks in VRAM's throat at the cost of texture quality""",
-	'warning': 'You suck',
+	# 'description': """Fit more dicks in VRAM's throat at the cost of texture quality""",
+	'description': """Decrease the amount of VRAM taken by textures""",
+	# 'warning': 'You suck',
 	'doc_url': '',
 	'category': 'Add Mesh',
 }
@@ -38,7 +39,7 @@ bl_info = {
 
 # All the associations are stored in a few database files for convenience
 
-
+# The effect can be easily reversed: the 'hobo_original_path' attribute of the image stores the path to the source image
 
 
 
