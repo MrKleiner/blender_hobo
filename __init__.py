@@ -3,10 +3,10 @@ hobo_name = __name__.partition('.')[0]
 bl_info = {
 	'name': 'Blender Hobo',
 	'author': 'MrKleiner',
-	'version': (0, 19),
-	'blender': (3, 4, 0),
+	'version': (0, 21),
+	'blender': (3, 4, 1),
 	'location': 'N menu',
-	# 'description': """Fit more dicks in VRAM's throat at the cost of texture quality""",
+	# 'description': """Fit more dicks down VRAM's throat at the cost of texture quality""",
 	'description': """Decrease the amount of VRAM taken by textures""",
 	# 'warning': 'You suck',
 	'doc_url': '',
@@ -19,7 +19,7 @@ bl_info = {
 
 
 #
-# This does not increase speed. This is only needed if you run out of VRAM due to large textures when rendering
+# This does not increase render speed. This is only needed if you run out of VRAM due to large textures when rendering
 #
 
 
@@ -258,6 +258,7 @@ def hobo_invert_exclusion_case(self, context):
 	for img in bpy.data.images:
 		img.hobo_image_params.do_convert = not img.hobo_image_params.do_convert
 
+
 def hobo_add_img_dep(image_hash):
 	dump_dir = Path(bpy.context.preferences.addons[hobo_name].preferences.dumpster_path)
 
@@ -356,7 +357,7 @@ def hobo_exec_opt(self, context, force=False):
 
 			if force == True:
 				tgt_img['hobo_hash'] = None
-				tgt_img.filepath = tgt_img['hobo_original_path']
+				tgt_img.filepath = tgt_img.get('hobo_original_path')
 				img_path = Path(bpy.path.abspath(tgt_img.filepath))
 				tgt_img['hobo_original_path'] = None
 
