@@ -85,11 +85,11 @@ addon_root_dir = Path(__file__).absolute().parent
 magix_exe = addon_root_dir / 'bins' / 'imgmagick' / 'magick.exe'
 nvtools_exe = addon_root_dir / 'bins' / 'nvtextools' / 'nvcompress.exe'
 nvtools_adv_exe = addon_root_dir / 'bins' / 'nvtextools' / 'nvtt_export.exe'
-current_blend = Path(bpy.path.abspath(bpy.data.filepath))
 
-global hdumpster_dir
+
+global hdumpster_dir, current_blend
 hdumpster_dir = None
-
+current_blend = None
 
 
 
@@ -375,11 +375,12 @@ def hobo_restore_originals(self, context):
 # The main function which goes through all the images and does the stuff
 # -------------------------------------------------------------------------
 def hobo_exec_opt(self, context, force=False):
-	global hdumpster_dir
+	global hdumpster_dir, current_blend
 
 	print('You hobo')
 	print(bpy.context.preferences.addons[hobo_name].preferences.dumpster_path)
 	hdumpster_dir = Path(bpy.context.preferences.addons[hobo_name].preferences.dumpster_path)
+	current_blend = Path(bpy.path.abspath(bpy.data.filepath))
 
 	ensure_database_present()
 
@@ -749,6 +750,11 @@ class IMAGE_EDITOR_PT_blender_hobo_image_params_gui(bpy.types.Panel):
 	bl_category = 'Hobo'
 	bl_label = 'Hobo'
 	# https://youtu.be/sT3joXENOb0
+
+	@classmethod
+	def poll(cls, context):
+		sima = context.space_data
+		return (sima.image)
 
 	def draw(self, context):
 		layout = self.layout
